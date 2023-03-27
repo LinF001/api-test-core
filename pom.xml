@@ -94,7 +94,7 @@
     java -jar target/api-test-core-1.0.0.jar
     -->
     <build>
-        <sourceDirectory>src/main/java</sourceDirectory>
+        <sourceDirectory>src/test/java</sourceDirectory>
         <pluginManagement>
             <plugins>
                 <plugin>
