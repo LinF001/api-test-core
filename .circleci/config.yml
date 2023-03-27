@@ -1,0 +1,307 @@
+---
+version: 2.1
+
+orbs:
+  aws-cli: circleci/aws-cli@0.1.16
+  vpn_client: cvs-digital/openvpn-client@0
+  bashenv-asm: cvs-digital/bashenv-asm@0
+  maven: cvs-digital/maven@0
+  checkmarx: cvs-digital/checkmarx@0
+  nexus: sonatype/nexus-platform-orb@1.0.13
+  sonar_scan: aetna/sonar_scan@0.2.0
+  snyk: cvs-digital/snyk@2
+  nexus-publisher: cvs-digital/nexus-publisher@1
+
+env-vpn: &env-vpn
+  - bashenv-asm/add:
+      secret_id: ${AWS_SECRET_MANAGER_ID_VPN}
+      env_map: |
+        {
+          "VPN_CONFIG" : "config",
+          "VPN_USERNAME" : "username",
+          "VPN_PASSWORD" : "password"
+        }
+
+env-snyk: &env-snyk
+  bashenv-asm/add:
+    secret_id: ${AWS_SECRET_MANAGER_ID_GLOBAL}
+    env_map: |
+      {
+        "SNYK_TOKEN" : "${snyk_token}",
+        "SNYK_ORG": "${snyk_org}"
+      }
+
+env-docker-reg: &env-docker-reg
+  bashenv-asm/add:
+    secret_id: ${AWS_SECRET_MANAGER_ID_GLOBAL}
+    env_map: |
+      {
+        "DOCKER_REGISTRY_URL" : "registry-server-url",
+        "DOCKER_REGISTRY_PATH" : "registry-docker-path",
+        "DOCKER_REGISTRY_PULL_URL": "registry-pull-server-url",
+        "DOCKER_REGISTRY_USERNAME": "registry-user-pass-username",
+        "DOCKER_REGISTRY_PASSWORD" : "registry-user-pass-password"
+      }
+
+env-nexus-server: &env-nexus-server
+  - bashenv-asm/add:
+      secret_id: ${AWS_SECRET_MANAGER_ID_GLOBAL}
+      env_map: |
+        {
+          "NEXUS_RM_SERVERURL": "nexus-server-url",
+          "NEXUS_RM_USERNAME": "registry-user-pass-username",
+          "NEXUS_RM_PASSWORD" : "registry-user-pass-password"
+        }
+
+env-checkmarx: &env-checkmarx
+  - bashenv-asm/add:
+      secret_id: ${AWS_SECRET_MANAGER_ID_GLOBAL}
+      env_map: |
+        {
+          "CX_PASSWORD" : "checkmarx-user-pass-password",
+          "CX_USERNAME" : "checkmarx-user-pass-username",
+          "CX_SERVER" : "checkmarx-server-url",
+          "CX_ORG" : "checkmarx-org-path"
+        }
+
+env-sonarcloud: &env-sonarcloud
+  - bashenv-asm/add:
+      secret_id: ${AWS_SECRET_MANAGER_ID_GLOBAL}
+      env_map: |
+        {
+          "SONAR_LOGIN" : "sonar-login-token",
+          "SONAR_URL" : "sonar-server-url"
+        }
+
+env-maven: &env-maven
+  - run:
+      name: Setting Maven project information as BASH_ENV
+      command: |
+        echo "export CCI_MAVEN_PROJECT_GROUP_ID=$(mvn org.apache.maven.plugins:maven-help-plugin:3.1.0:evaluate -Dexpression=project.groupId -q -DforceStdout)" >> ${BASH_ENV}
+        echo "export CCI_MAVEN_PROJECT_ARTIFACT_ID=$(mvn org.apache.maven.plugins:maven-help-plugin:3.1.0:evaluate -Dexpression=project.artifactId -q -DforceStdout)" >> ${BASH_ENV}
+        echo "export CCI_MAVEN_PROJECT_VERSION=$(mvn org.apache.maven.plugins:maven-help-plugin:3.1.0:evaluate -Dexpression=project.version -q -DforceStdout)" >> ${BASH_ENV}
+        echo "export CCI_MAVEN_PROJECT_VERSION_NO_QUALIFIER=$(mvn org.apache.maven.plugins:maven-help-plugin:3.1.0:evaluate -Dexpression=project.version -q -DforceStdout | sed -e 's/\-SNAPSHOT\|\-RELEASE\|\.SNAPSHOT\|\.RELEASE//g')" >> ${BASH_ENV}
+
+jobs:
+  build-jar:
+    machine:
+      image: ubuntu-2004:current
+    steps:
+      - checkout
+      - aws-cli/setup
+      - <<: *env-vpn
+      - <<: *env-maven
+      - vpn_client/connect
+      - maven/init:
+          settings: ${MAVEN_SETTINGS}
+          circleci_openjdk_tag: 11-jdk
+      - maven/test:
+          store_test_results: true
+      - maven/package:
+          skipTest: true
+          store_artifacts: true
+          store_path: target/${CCI_MAVEN_PROJECT_ARTIFACT_ID}-${CCI_MAVEN_PROJECT_VERSION}.jar
+      - persist_to_workspace:
+          root: ./target
+          paths:
+            - "*.jar"
+      - persist_to_workspace:
+          root: .
+          paths:
+            - ./target
+
+  publish-jar:
+    machine:
+      image: ubuntu-2004:current
+    parameters:
+      version-qualifier:
+        type: enum
+        enum: ["SNAPSHOT", "RELEASE"]
+        default: SNAPSHOT
+      repository:
+        type: enum
+        enum: ["maven2-snapshots", "maven-releases"]
+        default: maven2-snapshots
+    steps:
+      - checkout
+      - aws-cli/setup
+      - <<: *env-vpn
+      - <<: *env-nexus-server
+      - <<: *env-maven
+      - vpn_client/connect
+      - maven/init:
+          settings: ${MAVEN_SETTINGS}
+          circleci_openjdk_tag: 11-jdk
+      - maven/mvn:
+          command: >-
+            org.codehaus.mojo:versions-maven-plugin:set -DnewVersion=${CCI_MAVEN_PROJECT_VERSION_NO_QUALIFIER}-<< parameters.version-qualifier >>
+      - nexus-publisher/publish-maven:
+          repository: << parameters.repository >>
+          filename: target/${CCI_MAVEN_PROJECT_ARTIFACT_ID}-${CCI_MAVEN_PROJECT_VERSION}.jar
+          pom_file_to_upload: pom.xml
+          workspace: .
+
+  scan-checkmarx:
+    machine:
+      image: ubuntu-2004:current
+    steps:
+      - checkout
+      - aws-cli/setup
+      - <<: *env-vpn
+      - <<: *env-checkmarx
+      - vpn_client/connect
+      - checkmarx/scan
+
+  scan-snyk:
+    machine:
+      image: ubuntu-2004:current
+    parameters:
+      send-to-console:
+        type: boolean
+        default: true
+    steps:
+      - checkout
+      - aws-cli/setup
+      - <<: *env-vpn
+      - <<: *env-maven
+      - <<: *env-docker-reg
+      - vpn_client/connect
+      - maven/init:
+          settings: ${MAVEN_SETTINGS}
+          circleci_openjdk_tag: 11-jdk
+      - <<: *env-snyk
+      - snyk/scan:
+          all-projects: true
+          send-to-console: << parameters.send-to-console >>
+      - vpn_client/disconnect
+
+  init-sonar-project:
+    # use circleci/python:2.7-stretch docker image as excutor which is default excutor of circleci/aws-cli orb
+    docker:
+      - image: circleci/python:2.7-stretch
+    steps:
+      - aws-cli/setup
+      - <<: *env-sonarcloud
+      - run:
+          name: "Create the SonarCloud project"
+          command: |
+            set -x
+            curl -u ${SONAR_LOGIN}: \
+             -d "name=${CIRCLE_PROJECT_REPONAME}&organization=${GITHUB_ORG}&project=${GITHUB_ORG}_${CIRCLE_PROJECT_REPONAME}" \
+             -X POST "${SONAR_URL}/api/projects/create"
+
+workflows:
+  version: 2
+  pull_request:
+    jobs:
+      - build-jar:
+          context: cci-global
+          filters:
+            branches:
+              ignore:
+                - main
+
+      - init-sonar-project:
+          context: cci-global
+          filters:
+            branches:
+              ignore:
+                - main
+
+      - sonar_scan/pull_request:
+          context: cci-global
+          requires:
+            - init-sonar-project
+            - build-jar
+          attach_workspace_at: .
+          filters:
+            branches:
+              ignore:
+                - main
+
+      - scan-snyk:
+          context: cci-global
+          send-to-console: false
+          filters:
+            branches:
+              ignore:
+                - main
+
+      - scan-checkmarx:
+          context: cci-global
+          filters:
+            branches:
+              ignore:
+                - main
+
+      - publish-jar:
+          name: publish-jar-snapshot
+          context: cci-global
+          version-qualifier: SNAPSHOT
+          repository: maven2-snapshots
+          requires:
+            - build-jar
+            - scan-checkmarx
+            - sonar_scan/pull_request
+            - scan-snyk
+          filters:
+            branches:
+              ignore:
+                - main
+
+  on_merge:
+    jobs:
+      - build-jar:
+          context: cci-global
+          filters:
+            branches:
+              only:
+                - main
+
+      - init-sonar-project:
+          context: cci-global
+          filters:
+            branches:
+              only:
+                - main
+
+      - sonar_scan/branch:
+          context: cci-global
+          requires:
+            - init-sonar-project
+            - build-jar
+          attach_workspace_at: .
+          filters:
+            branches:
+              only:
+                - main
+
+      - scan-snyk:
+          context: cci-global
+          send-to-console: true
+          filters:
+            branches:
+              only:
+                - main
+
+      - scan-checkmarx:
+          context: cci-global
+          filters:
+            branches:
+              only:
+                - main
+
+      - publish-jar:
+          name: publish-jar-release
+          context: cci-global
+          version-qualifier: RELEASE
+          repository: maven-releases
+          requires:
+            - build-jar
+            - scan-checkmarx
+            - sonar_scan/branch
+            - scan-snyk
+          filters:
+            branches:
+              only:
+                - main
